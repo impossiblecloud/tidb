@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pingcap/tidb/pkg/ddl"
 	"github.com/pingcap/tidb/pkg/ddl/logutil"
@@ -1229,6 +1231,70 @@ func TestReorgPartitionHandleNotExistNoPanic(t *testing.T) {
 	testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/ddl/CheckReorgInfoEmptyErr", "1*return(true)")
 
 	tk.MustExec("alter table t reorganize partition p1 into (partition p1a values less than (15), partition p1b values less than (20))")
+	tk.MustExec("admin check table t")
+	tk.MustQuery("select a from t order by a").Check(testkit.Rows("1", "10", "23", "34", "45", "56"))
+}
+
+// A DDL owner that retires in the middle of the reorg must keep the reorg
+// handle, so that the next owner resumes from it instead of starting over.
+func TestReorgPartitionKeepReorgHandleOnOwnerRetire(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tkHook := testkit.NewTestKit(t, store)
+	schemaName := "ReorgPartOwnerRetire"
+	tk.MustExec("create database " + schemaName)
+	tk.MustExec("use " + schemaName)
+	tk.MustExec(`create table t (a int unsigned primary key, b varchar(255), c int, key (b), key (c,b))` +
+		` partition by range (a) ` +
+		`(partition p0 values less than (10),` +
+		` partition p1 values less than (20),` +
+		` partition pMax values less than (MAXVALUE))`)
+	tk.MustExec(`insert into t values (1,"1",1), (10,"10",10),(23,"23",32),(34,"34",43),(45,"45",54),(56,"56",65)`)
+
+	// Make the job step return on "wait reorg timeout" quickly, which persists the job.
+	testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/ddl/updateProgressIntervalInMs", "return(50)")
+
+	ownerMgr := dom.DDL().OwnerManager()
+	var persisted, retiring, retired, checked, handleKept, snapshotKept atomic.Bool
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/onJobRunBefore", func(job *model.Job) {
+		if job.Type != model.ActionReorganizePartition || job.SchemaState != model.StateWriteReorganization {
+			return
+		}
+		// The job is loaded from storage here.
+		if !retiring.Load() {
+			if job.SnapshotVer != 0 {
+				persisted.Store(true)
+			}
+			return
+		}
+		if !retired.Load() || !checked.CompareAndSwap(false, true) {
+			return
+		}
+		// First run of the job by the next owner: it must find the reorg
+		// handle and the snapshot version, i.e. resume and not start over.
+		rows := tkHook.MustQuery(fmt.Sprintf("select count(*) from mysql.tidb_ddl_reorg where job_id = %d", job.ID)).Rows()
+		handleKept.Store(len(rows) == 1 && rows[0][0] == "1")
+		snapshotKept.Store(job.SnapshotVer != 0)
+	})
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/PartitionBackfillData", func(hasRows bool) {
+		if !hasRows || retiring.Load() {
+			return
+		}
+		// Hold the data copy until the reorg has been persisted, then retire the owner.
+		require.Eventually(t, persisted.Load, 10*time.Second, 10*time.Millisecond)
+		if !retiring.CompareAndSwap(false, true) {
+			return
+		}
+		require.NoError(t, ownerMgr.ResignOwner(context.Background()))
+		require.Eventually(t, func() bool { return !ownerMgr.IsOwner() }, 10*time.Second, 10*time.Millisecond)
+		retired.Store(true)
+	})
+
+	tk.MustExec("alter table t reorganize partition p0, p1 into (partition p0 values less than (20))")
+	require.True(t, retired.Load())
+	require.True(t, checked.Load())
+	require.True(t, handleKept.Load())
+	require.True(t, snapshotKept.Load())
 	tk.MustExec("admin check table t")
 	tk.MustQuery("select a from t order by a").Check(testkit.Rows("1", "10", "23", "34", "45", "56"))
 }

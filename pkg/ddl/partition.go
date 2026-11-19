@@ -3789,6 +3789,16 @@ func doPartitionReorgWork(w *worker, jobCtx *jobContext, job *model.Job, tbl tab
 		if kv.IsTxnRetryableError(err) {
 			return false, ver, errors.Trace(err)
 		}
+		if jobCtx.ctx.Err() != nil || dbterror.ErrNotOwner.Equal(err) {
+			// The scheduler context is cancelled when this node retires as DDL
+			// owner or shuts down. A retiring owner clears its ownership before
+			// cancelling the context, so the backfill can also return ErrNotOwner
+			// first. The reorg did not fail: keep the reorg handle so that the
+			// next owner resumes from it instead of starting over.
+			logutil.DDLLogger().Info("reorg partition interrupted, keep the reorg handle",
+				zap.Stringer("job", job), zap.Error(err), zap.NamedError("cause", context.Cause(jobCtx.ctx)))
+			return false, ver, errors.Trace(err)
+		}
 		if err1 := rh.RemoveDDLReorgHandle(job, reorgInfo.elements); err1 != nil {
 			logutil.DDLLogger().Warn("reorg partition job failed, RemoveDDLReorgHandle failed, can't convert job to rollback",
 				zap.Stringer("job", job), zap.Error(err1))
